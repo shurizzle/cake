@@ -5,16 +5,43 @@ use tokio::net::TcpStream;
 
 use super::{Context, Message, WorkerInfo};
 
+#[derive(Debug)]
+struct Transport {
+    device: Device,
+    stream: TcpStream,
+}
+
+impl Transport {
+    /// Send a Message to the worker and return a response.
+    async fn request(&mut self, req: Message<'_>) -> Result<Message<'static>> {
+        req.to_writer(&mut self.stream)
+            .await
+            .map_err(|e| anyhow!("error sending message {:?}: {}", req, e))?;
+
+        let (_, msg) = super::Message::from_reader(&mut self.stream)
+            .await
+            .map_err(|e| anyhow!("error receiving response for {:?}: {}", req, e))?;
+        Ok(msg)
+    }
+
+    async fn forward_request(&mut self, req: Message<'_>) -> Result<Tensor> {
+        let resp = self.request(req).await?;
+        match resp {
+            Message::Tensor(raw) => Ok(raw.into_tensor(&self.device)?),
+            _ => Err(anyhow!("unexpected response {:?}", &resp)),
+        }
+    }
+}
+
 /// A client object used by the master to connect and orchestrate the workers.
 /// From the Cake perspective, each worker is a server and the master uses
 /// multiple Client instances to connect to them.
 #[derive(Debug)]
 pub struct Client {
-    device: Device,
+    transport: Transport,
     address: String,
     layer_name: String,
-    stream: TcpStream,
-    info: WorkerInfo,
+    info: WorkerInfo<'static>,
 }
 
 impl Client {
@@ -26,44 +53,23 @@ impl Client {
         let stream = TcpStream::connect(&address)
             .await
             .map_err(|e| anyhow!("can't connect to {address}: {e}"))?;
-        let worker_info = WorkerInfo::default();
+        let worker_info = WorkerInfo::<'static>::default();
 
         let mut client = Self {
+            transport: Transport { device, stream },
             address,
-            device,
-            stream,
             layer_name,
             info: worker_info,
         };
 
-        let resp = client.request(Message::Hello).await?;
+        let resp = client.transport.request(Message::Hello).await?;
         client.info = if let Message::WorkerInfo(info) = resp {
             info
         } else {
-            return Err(anyhow!("unexpected worker info message: {:?}", &resp));
+            bail!("unexpected worker info message: {:?}", &resp);
         };
 
         Ok(client)
-    }
-
-    /// Send a Message to the worker and return a response.
-    async fn request(&mut self, req: Message) -> Result<Message> {
-        req.to_writer(&mut self.stream)
-            .await
-            .map_err(|e| anyhow!("error sending message {:?}: {}", req, e))?;
-
-        let (_, msg) = super::Message::from_reader(&mut self.stream)
-            .await
-            .map_err(|e| anyhow!("error receiving response for {:?}: {}", req, e))?;
-        Ok(msg)
-    }
-
-    async fn forward_request(&mut self, req: Message) -> Result<Tensor> {
-        let resp = self.request(req).await?;
-        match resp {
-            Message::Tensor(raw) => Ok(raw.to_tensor(&self.device)?),
-            _ => Err(anyhow!("unexpected response {:?}", &resp)),
-        }
     }
 }
 
@@ -103,13 +109,14 @@ impl super::Forwarder for Client {
         block_idx: usize,
         _: &mut Context,
     ) -> Result<Tensor> {
-        self.forward_request(super::Message::single_op(
-            &self.layer_name,
-            x,
-            index_pos,
-            block_idx,
-        ))
-        .await
+        self.transport
+            .forward_request(super::Message::single_op(
+                self.layer_name.as_str(),
+                x,
+                index_pos,
+                block_idx,
+            )?)
+            .await
     }
 
     /// Executes the worker's pipeline with multiple batched steps for this tensor.
@@ -119,7 +126,8 @@ impl super::Forwarder for Client {
         batch: Vec<(String, usize, usize)>,
         _: &mut Context,
     ) -> Result<Tensor> {
-        self.forward_request(super::Message::from_batch(x, batch))
+        self.transport
+            .forward_request(super::Message::from_batch(x, batch)?)
             .await
     }
 

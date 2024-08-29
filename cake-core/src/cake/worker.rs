@@ -1,11 +1,12 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use super::{Context, Forwarder, Message, WorkerInfo};
+use super::{Context, DeviceType, Forwarder, Message, WorkerInfo};
 use crate::{models::Generator, ModelType};
 
 use anyhow::Result;
@@ -32,31 +33,23 @@ impl<F: Forwarder> WorkerContext<F> {
     /// Create a WorkerInfo structure to be sent to the master.
     fn to_info(&self, latency: u128) -> WorkerInfo {
         WorkerInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            device: if self.device.is_cuda() {
-                "cuda".to_string()
-            } else if self.device.is_metal() {
-                "metal".to_string()
-            } else {
-                "cpu".to_string()
+            version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
+            os: Cow::Borrowed(std::env::consts::OS),
+            arch: Cow::Borrowed(std::env::consts::ARCH),
+            device: match &self.device {
+                Device::Cpu => DeviceType::Cpu,
+                Device::Cuda(_) => DeviceType::Cuda,
+                Device::Metal(_) => DeviceType::Metal,
             },
             device_idx: self.device_idx,
             latency,
-            dtype: format!("{:?}", self.dtype),
+            dtype: self.dtype,
         }
     }
 
     /// Create a copy of self with new kv-cache.
     fn get_client_context(&self) -> Self {
-
-        let cache = match &self.context.cache {
-            None => None,
-            Some(cache) => {
-                Some(cache.as_new())
-            }
-        };
+        let cache = self.context.cache.as_ref().map(|cache| cache.as_new());
 
         let mut cloned_context = self.context.clone();
         cloned_context.cache = cache;
@@ -67,7 +60,7 @@ impl<F: Forwarder> WorkerContext<F> {
             dtype: self.dtype,
             blocks: self.blocks.clone(),
             // each client loop gets a new cache
-            context: cloned_context
+            context: cloned_context,
         }
     }
 }
@@ -111,13 +104,14 @@ impl<G: Generator + 'static> Worker<G> {
             log::info!("loading {} ...", &block_layer_name);
 
             if ctx.args.model_type == ModelType::TextModel {
-                ctx.var_builder = Some(vb.clone().expect("Error retrieving var_builder").pp(block_layer_name));
+                ctx.var_builder = Some(
+                    vb.clone()
+                        .expect("Error retrieving var_builder")
+                        .pp(block_layer_name),
+                );
             }
 
-            let block = G::Shardable::load(
-                block_layer_name.to_string(),
-                &ctx,
-            )?;
+            let block = G::Shardable::load(block_layer_name.to_string(), ctx)?;
 
             blocks.insert(block_layer_name.to_string(), block);
         }
@@ -143,14 +137,14 @@ impl<G: Generator + 'static> Worker<G> {
             device_idx,
             dtype,
             blocks,
-            context: ctx.clone()
+            context: ctx.clone(),
         };
 
         Ok(Self { listener, context })
     }
 
     /// Read a message from the socket and return elapsed time, message size and message.
-    async fn read_message_timed<R>(mut socket: R) -> Result<(Duration, usize, Message)>
+    async fn read_message_timed<R>(mut socket: R) -> Result<(Duration, usize, Message<'static>)>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -162,7 +156,10 @@ impl<G: Generator + 'static> Worker<G> {
     }
 
     /// Write a message to the socket and return the elapsed time with written size.
-    async fn write_message_timed<W>(mut socket: W, message: Message) -> Result<(Duration, usize)>
+    async fn write_message_timed<W>(
+        mut socket: W,
+        message: Message<'_>,
+    ) -> Result<(Duration, usize)>
     where
         W: AsyncWriteExt + Unpin,
     {
@@ -215,20 +212,16 @@ impl<G: Generator + 'static> Worker<G> {
                     x,
                     index_pos,
                     block_idx,
-                } => (x, vec![(layer_name, index_pos, block_idx)]),
+                } => (x, vec![(layer_name.into_owned(), index_pos, block_idx)]),
                 // batched
                 Message::Batch { x, batch } => (x, batch),
                 _ => {
-                    return Err(anyhow!(
-                        "[{}] unhandled message in loop: {:?}",
-                        &client,
-                        op_message
-                    ));
+                    bail!("[{}] unhandled message in loop: {:?}", &client, op_message);
                 }
             };
 
             // load raw tensor to device
-            let mut x = x.to_tensor(&context.device).unwrap();
+            let mut x = x.into_tensor(&context.device).unwrap();
             let num_ops = ops.len();
             let start_ops = Instant::now();
 
@@ -249,7 +242,7 @@ impl<G: Generator + 'static> Worker<G> {
             let elaps_ops = start_ops.elapsed();
 
             // send response tensor
-            match Self::write_message_timed(&mut socket, Message::from_tensor(&x)).await {
+            match Self::write_message_timed(&mut socket, Message::from_tensor(&x)?).await {
                 Ok((elaps_write, written)) => {
                     let ops_per_sec = (num_ops as f64 / elaps_ops.as_secs_f64()) as usize;
                     let write_bytes_per_sec = (written as f64 / elaps_write.as_secs_f64()) as usize;
